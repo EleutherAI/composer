@@ -48,6 +48,8 @@ class SpeedMonitor(Callback):
     | ``throughput/samples_per_sec``   | batches) of the number of samples processed per second      |
     |                                  |                                                             |
     +----------------------------------+-------------------------------------------------------------+
+    | ``throughput/tflops_per_gpu      | MFU in TFLOPs/GPU, from https://arxiv.org/abs/2104.04473    |
+    +----------------------------------+-------------------------------------------------------------+
     | ``wall_clock/train``             | Total elapsed training time                                 |
     +----------------------------------+-------------------------------------------------------------+
     | ``wall_clock/val``               | Total elapsed validation time                               |
@@ -60,7 +62,16 @@ class SpeedMonitor(Callback):
             Defaults to 100.
     """
 
-    def __init__(self, window_size: int = 100):
+    def __init__(self, 
+        window_size: int = 100,
+        report_flops: bool = False,
+        # extra kwargs to allow callback to access. can leave as defaults if not reporting FLOPS
+        seq_length: int = None,
+        microbatch_size: int = None,
+        num_layers: int = None,
+        hidden_size: int = None,
+        world_size: int = None,
+    ):
         # Track the batch num samples and wct to compute throughput over a window of batches
         self.batch_start_num_samples = 0
         self.batch_start_wct = 0.0
@@ -70,6 +81,19 @@ class SpeedMonitor(Callback):
 
         # Keep track of time spent evaluating
         self.total_eval_wct = 0.0
+
+        # extras for flop counting
+        self.report_flops = report_flops
+
+        self.seq_length = seq_length
+        self.microbatch_size = microbatch_size
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.world_size = world_size if world_size is not None else os.environ.get('WORLD_SIZE', None)
+        if self.report_flops:
+            assert self.seq_len and self.microbatch_size and self.num_layers and self.hidden_size and self.world_size, \
+                    "WARNING: will log FLOPs. please make sure all appropriate kwargs are passed."
+
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -113,6 +137,14 @@ class SpeedMonitor(Callback):
             throughput = sum(self.batch_num_samples_buffer) / sum(self.batch_wct_buffer)
             logger.log_metrics({'throughput/samples_per_sec': throughput})
 
+            # compute MFU
+            batch_size = sum(self.batch_num_samples_buffer) / len(self.batch_num_samples_buffer)
+            use_grad_accum = True if (batch_size / (self.world_size * self.microbatch_size) > 1) else False
+
+            elapsed_time_per_iteration = sum(self.batch_wct_buffer) / len(self.batch_wct_buffer)
+            mfu = get_flops(elapsed_time_per_iteration, batch_size, use_grad_accum, self.seq_length, self.num_layers, self.hidden_size)
+            logger.log_metrics({'throughput/tflops_per_gpu': mfu})
+
         # Log the time
         # `state.timestamp` excludes any time spent in evaluation
         logger.log_metrics({
@@ -124,3 +156,21 @@ class SpeedMonitor(Callback):
     def eval_end(self, state: State, logger: Logger):
         del logger  # unused
         self.total_eval_wct += state.eval_timestamp.total_wct.total_seconds()
+
+
+def get_flops(elapsed_time_per_iteration, batch_size, use_grad_accum, seq_len, num_layers, hidden_size): 
+    """Calculate MFU in TFLOPs/gpu. copied from https://github.com/bigscience-workshop/Megatron-DeepSpeed/pull/283"""
+
+    # General TFLOPs formula (borrowed from Equation 3 in Section 5.1 of
+    # https://arxiv.org/pdf/2104.04473.pdf).
+    # The factor of 4 is when used with activation check-pointing,
+    # otherwise it will be 3, but for 200B model, activation check-pointing will always be on.
+    checkpoint_activations_factor = 4 if use_grad_accum else 3
+                                                                     
+    coefficient = 24
+    flops_per_iteration = (coefficient * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * \
+            (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+    tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
+
+    return tflops
+
